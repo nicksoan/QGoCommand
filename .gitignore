@@ -1,0 +1,5 @@
+# Cargo build output
+/target/
+**/*.rs.bk
+
+# Cargo.lock is committed: qgo-app is a shipped binary, not a library.
