@@ -1466,7 +1466,7 @@ mod tests {
             let output = results_scroll_area(ui, total_rows, |ui, rows| {
                 let count = rows.len();
                 for row in rows {
-                    ui.selectable_label(false, format!("Shortcut {row}"));
+                    let _ = ui.selectable_label(false, format!("Shortcut {row}"));
                 }
                 count
             });
