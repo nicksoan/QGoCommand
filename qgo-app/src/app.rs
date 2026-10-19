@@ -13,7 +13,10 @@ use crate::tray::{Tray, TrayCommand};
 use crate::windows::{SecondaryWindows, WindowKind};
 use egui::{CornerRadius, CursorIcon, Key, Modifiers, ResizeDirection, RichText, Stroke, Vec2};
 use qgo_core::matching::Autocomplete;
-use qgo_core::{matching, storage, telemetry, LaunchOutcome, LauncherSession, Prepared};
+use qgo_core::{
+    matching, storage, telemetry, LaunchOutcome, LaunchPreview, LauncherSession, Prepared,
+    TrustedLaunches,
+};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -332,6 +335,13 @@ pub enum AppEvent {
     Launched(LaunchOutcome),
 }
 
+#[derive(Clone)]
+struct PendingConfirmation {
+    input: String,
+    selected: Option<usize>,
+    preview: LaunchPreview,
+}
+
 pub struct QGoApp {
     /// Shared with launch worker threads, which need `&mut` to bump usage counters.
     session: Arc<Mutex<LauncherSession>>,
@@ -355,6 +365,9 @@ pub struct QGoApp {
     sender: Sender<AppEvent>,
     windows: SecondaryWindows,
     toast: Option<(String, Instant)>,
+    trusted_launches: TrustedLaunches,
+    pending_confirmation: Option<PendingConfirmation>,
+    confirmation_error: Option<String>,
     last_height: f32,
     current_width: f32,
     last_scale_factor: Option<f32>,
@@ -414,6 +427,9 @@ impl QGoApp {
             sender,
             windows,
             toast: None,
+            trusted_launches: TrustedLaunches::load(),
+            pending_confirmation: None,
+            confirmation_error: None,
             last_height: 0.0,
             current_width,
             last_scale_factor: cc.egui_ctx.native_pixels_per_point(),
@@ -590,9 +606,42 @@ impl QGoApp {
     /// then does the blocking part. A sequential chain sleeps for the sum of its
     /// delays, and the render loop locks the same mutex every frame — holding it
     /// across those sleeps would freeze the app for the length of the chain.
-    fn launch(&mut self, ctx: &egui::Context) {
+    fn request_launch(&mut self, ctx: &egui::Context) -> bool {
+        self.trusted_launches = TrustedLaunches::load();
         let input = self.search_text.clone();
         let selected = self.selected_index();
+        let preview = {
+            let session = lock(&self.session);
+            session.preview_launch(&input, selected)
+        };
+
+        if let Some(preview) = preview {
+            let untrusted: Vec<_> = preview
+                .risks
+                .iter()
+                .filter(|risk| !self.trusted_launches.contains(risk))
+                .cloned()
+                .collect();
+            if !untrusted.is_empty() {
+                self.confirmation_error = None;
+                self.pending_confirmation = Some(PendingConfirmation {
+                    input,
+                    selected,
+                    preview: LaunchPreview {
+                        key: preview.key,
+                        risks: untrusted,
+                    },
+                });
+                ctx.request_repaint();
+                return false;
+            }
+        }
+
+        self.launch_confirmed(input, selected, ctx);
+        true
+    }
+
+    fn launch_confirmed(&self, input: String, selected: Option<usize>, ctx: &egui::Context) {
         let session = Arc::clone(&self.session);
         let sender = self.sender.clone();
         let ctx = ctx.clone();
@@ -609,6 +658,104 @@ impl QGoApp {
             let _ = sender.send(AppEvent::Launched(outcome));
             ctx.request_repaint();
         });
+    }
+
+    fn show_launch_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_confirmation.clone() else {
+            return;
+        };
+
+        enum Action {
+            Cancel,
+            RunOnce,
+            AlwaysTrust,
+        }
+
+        let response = egui::Modal::new(egui::Id::new("launch-confirmation"))
+            .frame(
+                egui::Frame::new()
+                    .fill(self.theme.surface)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .inner_margin(18)
+                    .corner_radius(10),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.heading("Run executable shortcut?");
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "'{}' can run code with your Windows user permissions.",
+                    pending.preview.key
+                ));
+                ui.label("Only continue if you created these targets or trust their source.");
+                if let Some(error) = &self.confirmation_error {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xF0, 0x7A, 0x7A),
+                        format!("Could not save trust decision: {error}"),
+                    );
+                }
+                ui.add_space(12.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for risk in &pending.preview.risks {
+                            ui.group(|ui| {
+                                ui.strong(format!("{}: {}", risk.shortcut_key, risk.kind.label()));
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(&risk.target).monospace())
+                                        .wrap(),
+                                );
+                            });
+                            ui.add_space(6.0);
+                        }
+                    });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        Some(Action::Cancel)
+                    } else if ui.button("Run once").clicked() {
+                        Some(Action::RunOnce)
+                    } else if ui.button("Always trust these exact targets").clicked() {
+                        Some(Action::AlwaysTrust)
+                    } else {
+                        None
+                    }
+                })
+                .inner
+            });
+        let action = if response.should_close() {
+            Some(Action::Cancel)
+        } else {
+            response.inner
+        };
+
+        match action {
+            Some(Action::Cancel) => {
+                self.pending_confirmation = None;
+                self.confirmation_error = None;
+                self.focus_input = true;
+            }
+            Some(Action::RunOnce) => {
+                self.pending_confirmation = None;
+                self.confirmation_error = None;
+                self.launch_confirmed(pending.input, pending.selected, ctx);
+                self.hide_window(ctx);
+            }
+            Some(Action::AlwaysTrust) => {
+                if let Err(error) = self.trusted_launches.trust_all(&pending.preview.risks) {
+                    self.confirmation_error = Some(error.to_string());
+                    return;
+                }
+                self.pending_confirmation = None;
+                self.confirmation_error = None;
+                self.launch_confirmed(pending.input, pending.selected, ctx);
+                self.hide_window(ctx);
+            }
+            None => {}
+        }
     }
 
     /// `HandleUpDownNavigation` — arrows on an empty box reveal the most-used
@@ -911,6 +1058,7 @@ impl eframe::App for QGoApp {
         // `epi_integration.rs`). Opening one from the tray is the normal case,
         // and the launcher is hidden exactly then.
         self.render_secondary(ctx);
+        self.show_launch_confirmation(ctx);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -927,14 +1075,20 @@ impl eframe::App for QGoApp {
             return;
         }
 
-        match self.read_keys(&ctx) {
+        let key = if self.pending_confirmation.is_none() {
+            self.read_keys(&ctx)
+        } else {
+            None
+        };
+        match key {
             Some(LauncherKey::Escape) => {
                 self.hide_window(&ctx);
                 return;
             }
             Some(LauncherKey::Enter) => {
-                self.launch(&ctx);
-                self.hide_window(&ctx);
+                if self.request_launch(&ctx) {
+                    self.hide_window(&ctx);
+                }
                 return;
             }
             Some(LauncherKey::Tab) => self.autocomplete(),
@@ -1084,8 +1238,9 @@ impl QGoApp {
                             if response.double_clicked() {
                                 let ctx = ui.ctx().clone();
                                 self.selected_row = row;
-                                self.launch(&ctx);
-                                self.hide_window(&ctx);
+                                if self.request_launch(&ctx) {
+                                    self.hide_window(&ctx);
+                                }
                             }
                         }
                     });

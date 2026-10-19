@@ -12,6 +12,7 @@ use crate::expand::expand;
 use crate::launch::{execute_plan, plan_regular, user_profile_dir};
 use crate::matching;
 use crate::models::{AppSettings, ChainedShortcut, Shortcut};
+use crate::security::{classify_risk, LaunchRisk};
 use crate::storage;
 use crate::telemetry;
 use chrono::Utc;
@@ -36,6 +37,12 @@ pub enum Prepared {
     Ready(PendingLaunch),
     /// Nothing to run because no shortcut matched.
     Done(LaunchOutcome),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPreview {
+    pub key: String,
+    pub risks: Vec<LaunchRisk>,
 }
 
 /// A launch that has been resolved and accounted for, and is ready to block.
@@ -182,6 +189,64 @@ impl LauncherSession {
     /// The filtered, ranked list the UI renders.
     pub fn filter(&self, search_text: &str, showing_most_used: bool) -> Vec<usize> {
         matching::filter_indices(&self.all, search_text, showing_most_used)
+    }
+
+    /// Resolves the exact targets that would run without changing usage
+    /// counters or touching the filesystem.
+    pub fn preview_launch(&self, input: &str, selected: Option<usize>) -> Option<LaunchPreview> {
+        let (key, param) = matching::split_input(input);
+        let index = selected.or_else(|| matching::resolve_by_key(&self.all, key))?;
+        let shortcut = self.all.get(index)?;
+
+        if !shortcut.is_chained {
+            let target = expand(&shortcut.template, param);
+            let risks = classify_risk(&target)
+                .map(|kind| vec![LaunchRisk::new(kind, shortcut.key.clone(), target)])
+                .unwrap_or_default();
+            return Some(LaunchPreview {
+                key: shortcut.key.clone(),
+                risks,
+            });
+        }
+
+        let chain_key = shortcut.chained_shortcut_key.as_deref()?;
+        let chain = self
+            .chains
+            .iter()
+            .find(|chain| chain.key.eq_ignore_ascii_case(chain_key))?;
+        let mut risks = Vec::new();
+        for item in chain.enabled_items() {
+            let Some(referenced) = self
+                .all
+                .iter()
+                .find(|candidate| candidate.key.eq_ignore_ascii_case(&item.shortcut_key))
+            else {
+                continue;
+            };
+            if referenced.is_chained {
+                continue;
+            }
+            let target = expand(&referenced.template, &item.parameters);
+            if let Some(kind) = classify_risk(&target) {
+                let trusted_target = if kind == crate::security::RiskKind::Executable
+                    && !item.parameters.is_empty()
+                {
+                    format!("{target} {}", item.parameters)
+                } else {
+                    target
+                };
+                risks.push(LaunchRisk::new(
+                    kind,
+                    referenced.key.clone(),
+                    trusted_target,
+                ));
+            }
+        }
+
+        Some(LaunchPreview {
+            key: chain.key.clone(),
+            risks,
+        })
     }
 
     /// First half of `LaunchSelected()`: resolve what to run and update the
@@ -397,5 +462,44 @@ mod tests {
             }
             Prepared::Done(other) => panic!("expected a runnable launch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn preview_finds_the_expanded_command_without_recording_usage() {
+        let s = session_with(
+            vec![Shortcut::new("build", "ps: Write-Host {value}")],
+            vec![],
+        );
+        let preview = s.preview_launch("build hello", None).unwrap();
+        assert_eq!(preview.key, "build");
+        assert_eq!(preview.risks.len(), 1);
+        assert_eq!(preview.risks[0].target, "ps: Write-Host hello");
+        assert_eq!(s.all[0].usage_count, 0);
+    }
+
+    #[test]
+    fn preview_collects_risky_enabled_chain_items() {
+        let mut chained = chain("work", "work tools");
+        chained.chain_items = vec![
+            ShortcutChainItem {
+                shortcut_key: "script".into(),
+                parameters: "safe".into(),
+                ..Default::default()
+            },
+            ShortcutChainItem {
+                shortcut_key: "website".into(),
+                ..Default::default()
+            },
+        ];
+        let s = session_with(
+            vec![
+                Shortcut::new("script", "cmd: echo {value}"),
+                Shortcut::new("website", "https://example.com"),
+            ],
+            vec![chained],
+        );
+        let preview = s.preview_launch("work", None).unwrap();
+        assert_eq!(preview.risks.len(), 1);
+        assert_eq!(preview.risks[0].target, "cmd: echo safe");
     }
 }

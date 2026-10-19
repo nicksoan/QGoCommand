@@ -11,7 +11,7 @@
 use crate::theme::Theme;
 use egui::{Context, ViewportBuilder, ViewportId};
 use qgo_core::models::{ChainedShortcut, ExecutionMode, Shortcut, ShortcutChainItem};
-use qgo_core::{startup, storage, telemetry, LauncherSession};
+use qgo_core::{security, startup, storage, telemetry, LauncherSession};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,7 +97,7 @@ impl SecondaryWindows {
         }
 
         if let Some(state) = &mut self.chains {
-            let (keep, saved) = show_chains(ctx, state);
+            let (keep, saved) = show_chains(ctx, state, session);
             changed |= saved;
             if !keep {
                 self.chains = None;
@@ -266,13 +266,41 @@ fn viewport<R>(
 pub struct SettingsState {
     settings: qgo_core::AppSettings,
     message: String,
+    startup_locked: bool,
 }
 
 impl SettingsState {
     fn load() -> Self {
+        let mut settings = storage::load_settings();
+        let mut message = String::new();
+        let mut startup_locked = false;
+        match startup::startup_state() {
+            Ok(state) => {
+                settings.start_with_windows = state.is_enabled();
+                match state {
+                    startup::StartupState::DisabledByUser => {
+                        startup_locked = true;
+                        message =
+                            "Startup was disabled in Windows Settings and can only be re-enabled there."
+                                .into();
+                    }
+                    startup::StartupState::DisabledByPolicy => {
+                        startup_locked = true;
+                        message = "Startup is disabled by administrator policy.".into();
+                    }
+                    startup::StartupState::EnabledByPolicy => {
+                        startup_locked = true;
+                        message = "Startup is enabled by administrator policy.".into();
+                    }
+                    _ => {}
+                }
+            }
+            Err(error) => message = format!("Could not read startup status: {error}"),
+        }
         Self {
-            settings: storage::load_settings(),
-            message: String::new(),
+            settings,
+            message,
+            startup_locked,
         }
     }
 }
@@ -313,9 +341,12 @@ fn show_settings(ctx: &Context, state: &mut SettingsState, theme: Theme) -> (boo
                                     .color(theme.foreground.gamma_multiply(0.55)),
                             );
                             ui.add_space(12.0);
-                            ui.checkbox(
-                                &mut state.settings.start_with_windows,
-                                "Start QGo with Windows",
+                            ui.add_enabled(
+                                !state.startup_locked,
+                                egui::Checkbox::new(
+                                    &mut state.settings.start_with_windows,
+                                    "Start QGo with Windows",
+                                ),
                             );
                             ui.checkbox(
                                 &mut state.settings.minimize_to_tray,
@@ -415,6 +446,36 @@ fn show_settings(ctx: &Context, state: &mut SettingsState, theme: Theme) -> (boo
                                 .small()
                                 .color(theme.foreground.gamma_multiply(0.55)),
                             );
+                            ui.add_space(12.0);
+                            let trusted = qgo_core::TrustedLaunches::load();
+                            let approval_label = if trusted.len() == 1 {
+                                "1 executable target is trusted".to_string()
+                            } else {
+                                format!("{} executable targets are trusted", trusted.len())
+                            };
+                            ui.label(
+                                egui::RichText::new(approval_label)
+                                    .small()
+                                    .color(theme.foreground.gamma_multiply(0.65)),
+                            );
+                            if ui
+                                .add_enabled(
+                                    !trusted.is_empty(),
+                                    egui::Button::new("Forget trusted targets"),
+                                )
+                                .clicked()
+                            {
+                                match qgo_core::TrustedLaunches::clear_saved() {
+                                    Ok(()) => {
+                                        state.message =
+                                            "Trusted executable targets were cleared.".into()
+                                    }
+                                    Err(error) => {
+                                        state.message =
+                                            format!("Could not clear trusted targets: {error}")
+                                    }
+                                }
+                            }
                         },
                     );
                 });
@@ -424,13 +485,48 @@ fn show_settings(ctx: &Context, state: &mut SettingsState, theme: Theme) -> (boo
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if primary_button(ui, "Save changes").clicked() {
-                        match storage::save_settings(&merge_owned_fields(&state.settings)) {
-                            Ok(()) => {
-                                startup::set_run_at_startup(state.settings.start_with_windows);
-                                state.message = "Settings saved successfully.".into();
-                                saved = true;
+                        let requested_startup = state.settings.start_with_windows;
+                        let startup_result = startup::set_run_at_startup(requested_startup);
+                        let mut settings = merge_owned_fields(&state.settings);
+                        if let Ok(status) = startup_result.as_ref() {
+                            settings.start_with_windows = status.is_enabled();
+                            state.settings.start_with_windows = status.is_enabled();
+                        } else if let Ok(status) = startup::startup_state() {
+                            settings.start_with_windows = status.is_enabled();
+                            state.settings.start_with_windows = status.is_enabled();
+                        }
+
+                        match storage::save_settings(&settings) {
+                            Err(error) => {
+                                state.message = format!("Could not save settings: {error}");
                             }
-                            Err(e) => state.message = format!("Could not save settings: {e}"),
+                            Ok(()) => match startup_result {
+                                Ok(status) => {
+                                    state.message = match status {
+                                        startup::StartupState::DisabledByUser => {
+                                            state.startup_locked = true;
+                                            "Settings saved. Startup can only be re-enabled in Windows Settings."
+                                                .into()
+                                        }
+                                        startup::StartupState::DisabledByPolicy => {
+                                            state.startup_locked = true;
+                                            "Settings saved. Startup is disabled by administrator policy."
+                                                .into()
+                                        }
+                                        startup::StartupState::EnabledByPolicy => {
+                                            state.startup_locked = true;
+                                            "Settings saved. Startup is enabled by administrator policy."
+                                                .into()
+                                        }
+                                        _ => "Settings saved successfully.".into(),
+                                    };
+                                    saved = true;
+                                }
+                                Err(error) => {
+                                    state.message =
+                                        format!("Could not update startup setting: {error}");
+                                }
+                            },
                         }
                     }
                     if secondary_button(ui, "Reset defaults", theme).clicked() {
@@ -661,6 +757,29 @@ fn show_manage(ctx: &Context, state: &mut ManageState, theme: Theme) -> (bool, b
                                         .hint_text("URL, file path, folder, cmd:, or ps:")
                                         .background_color(theme.shell),
                                 );
+                                ui.add_space(6.0);
+                                let classification =
+                                    security::display_classification(&shortcut.template);
+                                let risky = security::classify_risk(&shortcut.template).is_some();
+                                ui.label(
+                                    egui::RichText::new(classification)
+                                        .small()
+                                        .strong()
+                                        .color(if risky {
+                                            egui::Color32::from_rgb(0xF0, 0xB3, 0x5A)
+                                        } else {
+                                            theme.foreground.gamma_multiply(0.65)
+                                        }),
+                                );
+                                if risky {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "This shortcut can run code. Only use targets you created or trust.",
+                                        )
+                                        .small()
+                                        .color(theme.foreground.gamma_multiply(0.7)),
+                                    );
+                                }
                                 ui.add_space(8.0);
                                 egui::Frame::new()
                                     .fill(crate::theme::ACCENT.gamma_multiply(0.1))
@@ -749,7 +868,16 @@ impl ChainsState {
     }
 }
 
-fn show_chains(ctx: &Context, state: &mut ChainsState) -> (bool, bool) {
+fn show_chains(
+    ctx: &Context,
+    state: &mut ChainsState,
+    session: &Arc<Mutex<LauncherSession>>,
+) -> (bool, bool) {
+    let available = session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .all
+        .clone();
     let (keep, saved) = viewport(
         ctx,
         "qgo-chains",
@@ -829,11 +957,12 @@ fn show_chains(ctx: &Context, state: &mut ChainsState) -> (bool, bool) {
 
             let mut remove: Option<usize> = None;
             egui::Grid::new("chain-items")
-                .num_columns(5)
+                .num_columns(6)
                 .striped(true)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| {
                     ui.strong("Shortcut");
+                    ui.strong("Type");
                     ui.strong("Parameters");
                     ui.strong("Delay (ms)");
                     ui.strong("Enabled");
@@ -843,6 +972,28 @@ fn show_chains(ctx: &Context, state: &mut ChainsState) -> (bool, bool) {
                     for (i, item) in chain.chain_items.iter_mut().enumerate() {
                         ui.add(
                             egui::TextEdit::singleline(&mut item.shortcut_key).desired_width(160.0),
+                        );
+                        let target = available
+                            .iter()
+                            .find(|shortcut| {
+                                shortcut.key.eq_ignore_ascii_case(&item.shortcut_key)
+                                    && !shortcut.is_chained
+                            })
+                            .map(|shortcut| shortcut.template.as_str());
+                        let (label, risky) = match target {
+                            Some(target) => (
+                                security::display_classification(target),
+                                security::classify_risk(target).is_some(),
+                            ),
+                            None => ("Missing shortcut", false),
+                        };
+                        ui.colored_label(
+                            if risky {
+                                egui::Color32::from_rgb(0xF0, 0xB3, 0x5A)
+                            } else {
+                                ui.visuals().text_color()
+                            },
+                            label,
                         );
                         ui.add(
                             egui::TextEdit::singleline(&mut item.parameters).desired_width(200.0),

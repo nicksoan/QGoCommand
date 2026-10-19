@@ -37,6 +37,7 @@ pub mod launch;
 pub mod matching;
 pub mod models;
 pub mod paths;
+pub mod security;
 pub mod serde_cs;
 pub mod session;
 pub mod startup;
@@ -45,4 +46,5 @@ pub mod telemetry;
 pub mod version;
 
 pub use models::{AppSettings, ChainedShortcut, ExecutionMode, Shortcut, ShortcutChainItem};
-pub use session::{LaunchOutcome, LauncherSession, PendingLaunch, Prepared};
+pub use security::{LaunchRisk, RiskKind, TrustedLaunches};
+pub use session::{LaunchOutcome, LaunchPreview, LauncherSession, PendingLaunch, Prepared};

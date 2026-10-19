@@ -35,6 +35,57 @@ cargo clippy --workspace
 The release profile sets `windows_subsystem = "windows"`, so there is no console
 window — matching `<OutputType>WinExe</OutputType>`.
 
+## Package and publish
+
+QGo uses the same distribution model as the earlier .NET application: a signed
+MSIX package and a stable `QGo.Installer.appinstaller` file hosted in Azure Blob
+Storage.
+The Rust compiler produces the full application as `qgo.exe`; the packaging
+script adds it to the MSIX, signs the package, and creates the update feed.
+
+The signing certificate must be installed in `Cert:\CurrentUser\My` or
+`Cert:\LocalMachine\My`. Its subject must match the publisher of the previous
+QGo package so Windows treats the Rust build as an update rather than a
+different application.
+
+```powershell
+# Build, package, and sign locally.
+.\packaging\Publish-QGo.ps1 `
+  -CertificateThumbprint "YOUR_CERTIFICATE_THUMBPRINT"
+
+# Sign and upload using the current Azure CLI login.
+az login
+.\packaging\Publish-QGo.ps1 `
+  -CertificateThumbprint "YOUR_CERTIFICATE_THUMBPRINT" `
+  -Upload
+```
+
+Artifacts are written to `artifacts\`:
+
+* `QGo_<version>_x64.msix` is the immutable, versioned installer.
+* `QGo.Installer.appinstaller` is the stable URL users install from and Windows
+  checks for updates whenever QGo launches.
+* `SHA256SUMS.txt` contains the package checksum.
+
+The default feed remains
+`https://qgostorage.blob.core.windows.net/downloads/QGo.Installer.appinstaller`.
+Override `-AppInstallerBaseUri`, `-StorageAccount`, or `-Container` when
+publishing elsewhere. The upload uses Microsoft Entra authentication
+(`az storage blob upload --auth-mode login`), so no storage key or certificate
+is kept in the repository.
+
+When uploading manually, set the blob content types explicitly:
+
+* `.appinstaller`: `application/appinstaller`
+* `.msix`: `application/msix`
+* `.txt`: `text/plain`
+
+To validate package creation without signing or uploading:
+
+```powershell
+.\packaging\Publish-QGo.ps1 -SkipSigning
+```
+
 To check the port against a real profile written by the WPF app:
 
 ```powershell
@@ -72,11 +123,30 @@ an all-`:` dump means the shell painted but its contents did not.
 | Global hotkey | `RegisterHotKey` + `WndProc` hook | `global-hotkey` |
 | Tray | `System.Windows.Forms.NotifyIcon` | `tray-icon` |
 | Launching | `Process.Start(UseShellExecute = true)` | `ShellExecuteW` via `windows` |
-| Start with Windows | `Microsoft.Win32.Registry` | `winreg` |
+| Start with Windows | `Microsoft.Win32.Registry` | MSIX `StartupTask`; `winreg` fallback when unpackaged |
 | JSON | `System.Text.Json` | `serde_json` + adapters in `serde_cs` |
 
 `egui` was chosen over Tauri to avoid carrying a whole webview for an app whose
 primary UI is one text box.
+
+## Security
+
+The MSIX declares `runFullTrust` because QGo is a desktop launcher: it registers
+a global hotkey and can open applications, scripts and shell commands selected
+by the user. Full trust means the app runs with the signed-in user's normal
+permissions; it does not grant administrator or SYSTEM privileges.
+
+QGo visibly classifies shortcut targets in the shortcut and chain editors.
+Command Prompt, PowerShell, script and executable targets require confirmation
+the first time their exact expanded content is launched. Choosing **Always
+trust these exact targets** stores only SHA-256 fingerprints in
+`%LOCALAPPDATA%\QGo\Data\trusted-launches.json`; changing the target or its
+expanded arguments requires confirmation again. Saved approvals can be cleared
+from Settings.
+
+Installed MSIX builds register **Start QGo with Windows** through the package's
+Windows StartupTask, making it manageable in Windows Settings and Task Manager.
+Unpackaged development builds retain the per-user registry fallback.
 
 ### The hidden-window problem
 

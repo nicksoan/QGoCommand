@@ -50,6 +50,12 @@ pub fn usage_stats_backup_path() -> PathBuf {
     data_dir().join("usage-stats.json.backup")
 }
 
+/// Trust decisions for executable shortcuts. Kept separate from the shared
+/// profile so older QGo builds cannot accidentally erase them.
+pub fn trusted_launches_path() -> PathBuf {
+    data_dir().join("trusted-launches.json")
+}
+
 /// `%LOCALAPPDATA%\QGo\logs`
 pub fn logs_dir() -> PathBuf {
     qgo_dir().join("logs")
@@ -71,6 +77,7 @@ mod tests {
         assert!(settings_path().starts_with(&data));
         assert!(chained_shortcuts_path().starts_with(&data));
         assert!(usage_stats_path().starts_with(&data));
+        assert!(trusted_launches_path().starts_with(&data));
         assert_eq!(data.file_name().unwrap(), "Data");
     }
 }
