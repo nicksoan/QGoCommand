@@ -31,6 +31,41 @@ const ROW_CORNER: u8 = 8;
 const MAX_LIST_HEIGHT: f32 = 360.0;
 const TOAST_DURATION: Duration = Duration::from_secs(4);
 const RESIZE_EDGE: f32 = 8.0;
+const SEARCH_DELAY: Duration = Duration::from_millis(75);
+
+#[derive(Default)]
+struct SearchBuffer {
+    deadline: Option<Instant>,
+}
+
+impl SearchBuffer {
+    fn schedule(&mut self, now: Instant) {
+        self.deadline = Some(now + SEARCH_DELAY);
+    }
+
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+}
+
+fn results_scroll_area<R>(
+    ui: &mut egui::Ui,
+    total_rows: usize,
+    add_rows: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    // Measure against the list limit, not the previous native window height.
+    ui.set_max_height(MAX_LIST_HEIGHT);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    let row_height = (ui.text_style_height(&egui::TextStyle::Button)
+        + 2.0 * ui.spacing().button_padding.y)
+        .max(ui.spacing().interact_size.y);
+    egui::ScrollArea::vertical()
+        .max_height(MAX_LIST_HEIGHT)
+        .auto_shrink([false, true])
+        .animated(false)
+        .show_rows(ui, row_height, total_rows, add_rows)
+}
 
 fn clamp_window_width(width: f32) -> f32 {
     width.clamp(MIN_WIDTH, MAX_WIDTH)
@@ -352,6 +387,7 @@ pub struct QGoApp {
     showing_most_used: bool,
     placeholder: String,
     autocomplete: Autocomplete,
+    search_buffer: SearchBuffer,
     theme: Theme,
     hotkey: HotkeyManager,
     tray: Option<Tray>,
@@ -415,6 +451,7 @@ impl QGoApp {
             showing_most_used: false,
             placeholder: String::new(),
             autocomplete: Autocomplete::default(),
+            search_buffer: SearchBuffer::default(),
             theme,
             hotkey,
             tray,
@@ -470,6 +507,7 @@ impl QGoApp {
         self.showing_most_used = false;
         self.autocomplete.reset();
         self.visible.clear();
+        self.search_buffer = SearchBuffer::default();
         self.activate_window = false;
         self.focus_input = false;
         self.set_visible(ctx, false);
@@ -578,6 +616,7 @@ impl QGoApp {
     }
 
     fn refresh_visible(&mut self) {
+        self.search_buffer = SearchBuffer::default();
         let session = lock(&self.session);
         self.visible = session.filter(&self.search_text, self.showing_most_used);
         self.placeholder = matching::placeholder_for(&session.all, &self.search_text);
@@ -1080,6 +1119,14 @@ impl eframe::App for QGoApp {
         } else {
             None
         };
+        if self.search_buffer.deadline.is_some()
+            && matches!(
+                key,
+                Some(LauncherKey::Enter | LauncherKey::Tab | LauncherKey::Up | LauncherKey::Down)
+            )
+        {
+            self.refresh_visible();
+        }
         match key {
             Some(LauncherKey::Escape) => {
                 self.hide_window(&ctx);
@@ -1196,54 +1243,70 @@ impl QGoApp {
                         }
                         self.autocomplete.reset();
                         self.selected_row = 0;
-                        self.refresh_visible();
+                        self.placeholder.clear();
+                        if self.search_text.trim().is_empty() {
+                            self.refresh_visible();
+                        } else {
+                            self.search_buffer.schedule(Instant::now());
+                        }
                     }
                 });
+                if let Some(remaining) = self.search_buffer.remaining(Instant::now()) {
+                    if remaining.is_zero() {
+                        self.refresh_visible();
+                    } else {
+                        ui.ctx().request_repaint_after(remaining);
+                    }
+                }
             });
     }
 
     /// The results `ListBox`, capped at `MaxHeight="360"`.
     fn results(&mut self, ui: &mut egui::Ui, theme: Theme) {
-        let rows: Vec<(usize, String, bool)> = {
-            let session = lock(&self.session);
-            self.visible
-                .iter()
-                .filter_map(|&i| session.all.get(i).map(|s| (i, s.key.clone(), s.is_chained)))
-                .collect()
-        };
-
         egui::Frame::new()
             .fill(theme.surface)
             .corner_radius(CornerRadius::same(ROW_CORNER))
             .stroke(Stroke::new(1.0, theme::BORDER))
             .inner_margin(4)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(MAX_LIST_HEIGHT)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        for (row, (_, key, is_chained)) in rows.iter().enumerate() {
-                            let selected = row == self.selected_row;
-                            let label = if *is_chained {
-                                RichText::new(format!("{key}  ⛓")).color(theme.foreground)
-                            } else {
-                                RichText::new(key).color(theme.foreground)
-                            };
+                results_scroll_area(ui, self.visible.len(), |ui, row_range| {
+                    let rows: Vec<_> = {
+                        let session = lock(&self.session);
+                        row_range
+                            .filter_map(|row| {
+                                session
+                                    .all
+                                    .get(self.visible[row])
+                                    .map(|s| (row, s.key.clone(), s.is_chained))
+                            })
+                            .collect()
+                    };
+                    ui.set_width(ui.available_width());
+                    for (row, key, is_chained) in rows {
+                        let selected = row == self.selected_row;
+                        let label = if is_chained {
+                            RichText::new(format!("{key}  ⛓")).color(theme.foreground)
+                        } else {
+                            RichText::new(key).color(theme.foreground)
+                        };
 
-                            let response = ui.selectable_label(selected, label);
-                            if response.clicked() {
-                                self.selected_row = row;
-                            }
-                            if response.double_clicked() {
-                                let ctx = ui.ctx().clone();
-                                self.selected_row = row;
-                                if self.request_launch(&ctx) {
-                                    self.hide_window(&ctx);
-                                }
+                        let response = ui.selectable_label(selected, label);
+                        // Buffered rows belong to the previous query.
+                        if self.search_buffer.deadline.is_some() {
+                            continue;
+                        }
+                        if response.clicked() {
+                            self.selected_row = row;
+                        }
+                        if response.double_clicked() {
+                            let ctx = ui.ctx().clone();
+                            self.selected_row = row;
+                            if self.request_launch(&ctx) {
+                                self.hide_window(&ctx);
                             }
                         }
-                    });
+                    }
+                });
             });
     }
 
@@ -1354,6 +1417,81 @@ fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_waits_for_a_short_pause_after_the_latest_edit() {
+        let start = Instant::now();
+        let mut buffer = SearchBuffer::default();
+        assert_eq!(buffer.remaining(start), None);
+        buffer.schedule(start);
+        assert_eq!(buffer.remaining(start), Some(SEARCH_DELAY));
+
+        let next_edit = start + Duration::from_millis(50);
+        buffer.schedule(next_edit);
+        assert_eq!(
+            buffer.remaining(start + SEARCH_DELAY),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            buffer.remaining(next_edit + SEARCH_DELAY),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn expired_search_stays_ready_until_refreshed() {
+        let start = Instant::now();
+        let mut buffer = SearchBuffer::default();
+        buffer.schedule(start);
+        assert_eq!(
+            buffer.remaining(start + Duration::from_secs(1)),
+            Some(Duration::ZERO)
+        );
+        buffer = SearchBuffer::default();
+        assert_eq!(buffer.remaining(start + Duration::from_secs(1)), None);
+    }
+
+    fn measure_results(total_rows: usize, window_height: f32) -> (f32, usize) {
+        let ctx = egui::Context::default();
+        let mut measured = (0.0, 0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(420.0, window_height),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            ui.add_space(50.0);
+            let output = results_scroll_area(ui, total_rows, |ui, rows| {
+                let count = rows.len();
+                for row in rows {
+                    let _ = ui.selectable_label(false, format!("Shortcut {row}"));
+                }
+                count
+            });
+            measured = (output.inner_rect.height(), output.inner);
+        });
+        measured
+    }
+
+    #[test]
+    fn results_expand_in_one_layout_even_from_a_collapsed_window() {
+        let (height, rendered_rows) = measure_results(10_000, 56.0);
+        assert!((height - MAX_LIST_HEIGHT).abs() < 1.0);
+        assert!(rendered_rows > 0 && rendered_rows < 100);
+        assert_eq!(measure_results(10_000, 500.0), (height, rendered_rows));
+    }
+
+    #[test]
+    fn results_shrink_to_fit_a_short_list() {
+        let (height, rendered_rows) = measure_results(1, 500.0);
+        assert!(height > 0.0 && height < MAX_LIST_HEIGHT);
+        assert_eq!(rendered_rows, 1);
+        let (height, rendered_rows) = measure_results(0, 500.0);
+        assert_eq!(height, 0.0);
+        assert_eq!(rendered_rows, 0);
+    }
 
     #[test]
     fn window_axis_is_clamped_to_negative_coordinate_monitor() {
