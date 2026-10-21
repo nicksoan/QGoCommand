@@ -4,9 +4,11 @@ The standalone Rust implementation of the QGo keyboard-driven shortcut
 launcher.
 
 It can reuse profiles created by earlier QGo versions: the application reads
-and writes `%LOCALAPPDATA%\QGo` using the existing JSON format. This is a data
-compatibility contract only; building and running this project does not require
-the earlier .NET codebase or runtime.
+and writes `%USERPROFILE%\AppData\Local\QGo` using the existing JSON format.
+When upgrading from an MSIX build, QGo copies existing data from the package's
+private storage the first time it starts. This is a data compatibility contract
+only; building and running this project does not require the earlier .NET
+codebase or runtime.
 
 ## Layout
 
@@ -96,7 +98,8 @@ Those tests are read-only and are ignored by default because they need a machine
 that has actually used QGo.
 
 To exercise it without touching your real data, point `LOCALAPPDATA` somewhere
-scratch:
+scratch (the application honors this unless it points inside the MSIX
+`Packages` directory):
 
 ```powershell
 $env:LOCALAPPDATA = "$env:TEMP\qgo-scratch"; cargo run
