@@ -49,6 +49,60 @@ impl SearchBuffer {
     }
 }
 
+fn search_input(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    placeholder: &str,
+    theme: Theme,
+    completed: bool,
+) -> egui::text_edit::TextEditOutput {
+    let id = ui.make_persistent_id("launcher-search");
+    if completed {
+        let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(text.chars().count()),
+            )));
+        state.store(ui.ctx(), id);
+        ui.memory_mut(|memory| memory.request_focus(id));
+    }
+
+    let available = ui.available_width() - 4.0;
+    let output = egui::TextEdit::singleline(text)
+        .id(id)
+        .lock_focus(true)
+        // The surrounding Frame already draws the search row.
+        .frame(egui::Frame::NONE)
+        .desired_width(available)
+        .min_size(Vec2::new(available, theme.font_size + 6.0))
+        .text_color(theme.foreground)
+        .hint_text(RichText::new("Type to search...").color(theme.foreground.gamma_multiply(0.6)))
+        .show(ui);
+
+    if !text.is_empty() && matching::split_input(text).1.is_empty() && !placeholder.is_empty() {
+        let hint = if text.ends_with(' ') {
+            placeholder.trim_start()
+        } else {
+            placeholder
+        };
+        let position = output.galley_pos
+            + output
+                .galley
+                .pos_from_cursor(output.galley.end())
+                .min
+                .to_vec2();
+        ui.painter().with_clip_rect(output.text_clip_rect).text(
+            position,
+            egui::Align2::LEFT_TOP,
+            hint,
+            egui::TextStyle::Body.resolve(ui.style()),
+            theme.foreground.gamma_multiply(0.6),
+        );
+    }
+    output
+}
+
 fn results_scroll_area<R>(
     ui: &mut egui::Ui,
     total_rows: usize,
@@ -820,7 +874,7 @@ impl QGoApp {
 
     /// Tab. Matches `MainWindow_KeyDown`: if the highlighted row is not already
     /// what is typed, drop that row into the box; otherwise cycle.
-    fn autocomplete(&mut self) {
+    fn autocomplete(&mut self) -> bool {
         let session = lock(&self.session);
         let selected = self.selected_index();
 
@@ -842,7 +896,7 @@ impl QGoApp {
                 self.search_text = shortcut.key.clone();
                 self.placeholder.clear();
             }
-            return;
+            return true;
         }
 
         let result =
@@ -857,7 +911,9 @@ impl QGoApp {
                 self.selected_row = row;
             }
             telemetry::instance().record_feature_usage("autocomplete");
+            return true;
         }
+        false
     }
 
     fn handle_command(&mut self, ctx: &egui::Context, command: TrayCommand) {
@@ -1127,6 +1183,7 @@ impl eframe::App for QGoApp {
         {
             self.refresh_visible();
         }
+        let mut completed = false;
         match key {
             Some(LauncherKey::Escape) => {
                 self.hide_window(&ctx);
@@ -1138,7 +1195,7 @@ impl eframe::App for QGoApp {
                 }
                 return;
             }
-            Some(LauncherKey::Tab) => self.autocomplete(),
+            Some(LauncherKey::Tab) => completed = self.autocomplete(),
             Some(LauncherKey::Up) => self.navigate(true),
             Some(LauncherKey::Down) => self.navigate(false),
             Some(LauncherKey::ContextMenu) => {
@@ -1159,7 +1216,7 @@ impl eframe::App for QGoApp {
         }
 
         let response = shell.show(ui, |ui| {
-            self.search_row(ui, _frame, theme);
+            self.search_row(ui, _frame, theme, completed);
             if self.list_visible() {
                 ui.add_space(8.0);
                 self.results(ui, theme);
@@ -1178,7 +1235,13 @@ impl eframe::App for QGoApp {
 
 impl QGoApp {
     /// The `SearchRow` border from `MainWindow.xaml`: logo, text box, hint.
-    fn search_row(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, theme: Theme) {
+    fn search_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        theme: Theme,
+        completed: bool,
+    ) {
         egui::Frame::new()
             .fill(theme.surface)
             .corner_radius(CornerRadius::same(ROW_CORNER))
@@ -1211,23 +1274,14 @@ impl QGoApp {
                     }
 
                     let previous = self.search_text.clone();
-                    let available = ui.available_width() - 4.0;
-                    let edit = ui.add_sized(
-                        Vec2::new(available, theme.font_size + 6.0),
-                        egui::TextEdit::singleline(&mut self.search_text)
-                            // The surrounding Frame already draws the search row.
-                            .frame(egui::Frame::NONE)
-                            .desired_width(available)
-                            .text_color(theme.foreground)
-                            .hint_text(
-                                RichText::new(if self.placeholder.is_empty() {
-                                    "Type to search..."
-                                } else {
-                                    self.placeholder.trim()
-                                })
-                                .color(theme.foreground.gamma_multiply(0.6)),
-                            ),
+                    let output = search_input(
+                        ui,
+                        &mut self.search_text,
+                        &self.placeholder,
+                        theme,
+                        completed,
                     );
+                    let edit = output.response;
 
                     if self.focus_input {
                         edit.request_focus();
@@ -1417,6 +1471,110 @@ fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_completion_keeps_focus_and_types_at_the_end_of_the_completed_key() {
+        for (key, typed, template) in [
+            (
+                "Helpdesk",
+                "helpdesk",
+                "https://helpdesk.example/{TicketNo}",
+            ),
+            ("Helpdesk", "help", "https://helpdesk.example/{TicketNo}"),
+            ("Hélpdesk", "hé", "https://helpdesk.example/{TicketNo}"),
+            ("Helpdesk", "help", "https://helpdesk.example/"),
+        ] {
+            let ctx = egui::Context::default();
+            let theme = Theme::from_settings(&Default::default());
+            let all = vec![qgo_core::models::Shortcut::new(key, template)];
+            let mut text = typed.to_string();
+            // Establish focus and a cursor/selection left over from the typed prefix.
+            for _ in 0..2 {
+                let _ = ctx.run_ui(Default::default(), |ui| {
+                    let mut output = search_input(ui, &mut text, "", theme, true);
+                    output
+                        .state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(1),
+                        )));
+                    output.state.store(ui.ctx(), output.response.id);
+                });
+            }
+
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                assert!(ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)));
+                let result = Autocomplete::default()
+                    .advance(&all, &text, Some(0), &[0])
+                    .unwrap();
+                text = result.search_text;
+                let output = search_input(ui, &mut text, &result.placeholder, theme, true);
+                assert!(output.response.has_focus());
+                let cursor = output.cursor_range.unwrap();
+                assert!(cursor.is_empty());
+                assert_eq!(
+                    cursor.primary.index,
+                    egui::text::CharIndex(text.chars().count())
+                );
+            });
+            let completed = text.clone();
+            let input = egui::RawInput {
+                events: vec![egui::Event::Text("12345".into())],
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let output = search_input(ui, &mut text, "", theme, false);
+                assert!(output.response.has_focus());
+            });
+            assert_eq!(text, format!("{completed}12345"));
+            if all[0].is_parameterized() {
+                assert_eq!(matching::split_input(&text), (key, "12345"));
+                assert_eq!(
+                    qgo_core::expand::expand(template, matching::split_input(&text).1),
+                    "https://helpdesk.example/12345"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parameter_hint_is_drawn_after_the_key_but_not_after_a_parameter() {
+        let ctx = egui::Context::default();
+        let theme = Theme::from_settings(&Default::default());
+        for (input, expected_hint) in [
+            ("Helpdesk", Some(" ticketno")),
+            ("Helpdesk ", Some("ticketno")),
+            ("Helpdesk 12345", None),
+        ] {
+            let mut text = input.to_string();
+            let output = ctx.run_ui(Default::default(), |ui| {
+                search_input(ui, &mut text, " ticketno", theme, false);
+            });
+            let hints: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text().contains("ticketno") => {
+                        Some(text.galley.text())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(hints, expected_hint.into_iter().collect::<Vec<_>>());
+            assert_eq!(text, input);
+        }
+    }
 
     #[test]
     fn search_waits_for_a_short_pause_after_the_latest_edit() {
