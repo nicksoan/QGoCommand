@@ -441,6 +441,14 @@ struct PendingConfirmation {
     preview: LaunchPreview,
 }
 
+fn should_hide_on_focus_loss(
+    window_visible: bool,
+    activate_window: bool,
+    focused: Option<bool>,
+) -> bool {
+    window_visible && !activate_window && focused == Some(false)
+}
+
 pub struct QGoApp {
     /// Shared with launch worker threads, which need `&mut` to bump usage counters.
     session: Arc<Mutex<LauncherSession>>,
@@ -561,7 +569,6 @@ impl QGoApp {
         self.autocomplete.reset();
         self.refresh_visible();
         self.set_visible(ctx, true);
-        self.activate_window = true;
         self.focus_input = true;
         self.glow_started = glow_enabled(&lock(&self.session).settings).then(Instant::now);
         self.restore_position = true;
@@ -576,13 +583,13 @@ impl QGoApp {
         self.autocomplete.reset();
         self.visible.clear();
         self.search_buffer = SearchBuffer::default();
-        self.activate_window = false;
         self.focus_input = false;
         self.set_visible(ctx, false);
     }
 
     fn set_visible(&mut self, ctx: &egui::Context, visible: bool) {
         self.window_visible = visible;
+        self.activate_window = visible;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
         if visible {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1141,6 +1148,14 @@ impl eframe::App for QGoApp {
             }
         }
 
+        if should_hide_on_focus_loss(
+            self.window_visible,
+            self.activate_window,
+            frame.winit_window().map(|window| window.has_focus()),
+        ) {
+            self.hide_window(ctx);
+        }
+
         if self.window_visible && self.activate_window {
             if let Some(window) = frame.winit_window() {
                 window.set_visible(true);
@@ -1505,6 +1520,23 @@ fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_launcher_hides_only_after_activation_and_focus_loss() {
+        assert!(should_hide_on_focus_loss(true, false, Some(false)));
+        assert!(!should_hide_on_focus_loss(true, false, Some(true)));
+        assert!(!should_hide_on_focus_loss(true, false, None));
+        assert!(!should_hide_on_focus_loss(true, true, Some(false)));
+        assert!(!should_hide_on_focus_loss(true, true, Some(true)));
+    }
+
+    #[test]
+    fn hidden_launcher_does_not_hide_again_on_focus_loss() {
+        for focused in [None, Some(false), Some(true)] {
+            assert!(!should_hide_on_focus_loss(false, false, focused));
+            assert!(!should_hide_on_focus_loss(false, true, focused));
+        }
+    }
 
     #[test]
     fn summon_glow_progress_expires_after_one_pulse() {
