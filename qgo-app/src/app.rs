@@ -32,6 +32,16 @@ const MAX_LIST_HEIGHT: f32 = 360.0;
 const TOAST_DURATION: Duration = Duration::from_secs(4);
 const RESIZE_EDGE: f32 = 8.0;
 const SEARCH_DELAY: Duration = Duration::from_millis(75);
+const GLOW_DURATION: Duration = Duration::from_millis(850);
+
+fn glow_progress(started: Instant, now: Instant) -> Option<f32> {
+    let elapsed = now.saturating_duration_since(started);
+    (elapsed < GLOW_DURATION).then(|| elapsed.as_secs_f32() / GLOW_DURATION.as_secs_f32())
+}
+
+fn glow_enabled(settings: &qgo_core::AppSettings) -> bool {
+    settings.show_glow_on_startup && !settings.reduce_animations
+}
 
 #[derive(Default)]
 struct SearchBuffer {
@@ -448,6 +458,7 @@ pub struct QGoApp {
     window_visible: bool,
     activate_window: bool,
     focus_input: bool,
+    glow_started: Option<Instant>,
     /// Set when showing, cleared once the saved position has been applied.
     restore_position: bool,
     logo: Option<egui::TextureHandle>,
@@ -485,6 +496,7 @@ impl QGoApp {
         theme.apply(&cc.egui_ctx);
 
         let start_hidden = session.settings.start_minimized_to_tray;
+        let startup_glow = !start_hidden && glow_enabled(&session.settings);
         let current_width = if session.settings.window_width.is_finite() {
             clamp_window_width(session.settings.window_width as f32)
         } else {
@@ -512,6 +524,7 @@ impl QGoApp {
             window_visible: !start_hidden,
             activate_window: !start_hidden,
             focus_input: !start_hidden,
+            glow_started: startup_glow.then(Instant::now),
             restore_position: false,
             logo,
             events,
@@ -550,6 +563,7 @@ impl QGoApp {
         self.set_visible(ctx, true);
         self.activate_window = true;
         self.focus_input = true;
+        self.glow_started = glow_enabled(&lock(&self.session).settings).then(Instant::now);
         self.restore_position = true;
     }
 
@@ -1227,6 +1241,26 @@ impl eframe::App for QGoApp {
             }
         });
 
+        if let Some(started) = self.glow_started {
+            if let Some(progress) = glow_progress(started, Instant::now()) {
+                let pulse = (std::f32::consts::PI * progress).sin();
+                let inset = 2.0 + 8.0 * progress;
+                let alpha = (pulse * 150.0).round() as u8;
+                ui.painter().rect_stroke(
+                    response.response.rect.shrink(inset),
+                    CornerRadius::same(CORNER.saturating_sub(inset.round() as u8)),
+                    Stroke::new(
+                        2.0 + pulse * 2.0,
+                        theme::GLOW.gamma_multiply(alpha as f32 / 255.0),
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+                ctx.request_repaint_after(Duration::from_millis(16));
+            } else {
+                self.glow_started = None;
+            }
+        }
+
         self.handle_window_edges(&ctx, response.response.rect);
 
         self.size_and_place(&ctx, response.response.rect.height());
@@ -1471,6 +1505,27 @@ fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summon_glow_progress_expires_after_one_pulse() {
+        let start = Instant::now();
+        assert_eq!(glow_progress(start, start), Some(0.0));
+        assert_eq!(glow_progress(start, start + GLOW_DURATION / 2), Some(0.5));
+        assert_eq!(glow_progress(start, start + GLOW_DURATION), None);
+    }
+
+    #[test]
+    fn summon_glow_respects_animation_settings() {
+        let mut settings = qgo_core::AppSettings::default();
+        assert!(glow_enabled(&settings));
+
+        settings.show_glow_on_startup = false;
+        assert!(!glow_enabled(&settings));
+
+        settings.show_glow_on_startup = true;
+        settings.reduce_animations = true;
+        assert!(!glow_enabled(&settings));
+    }
 
     #[test]
     fn tab_completion_keeps_focus_and_types_at_the_end_of_the_completed_key() {
