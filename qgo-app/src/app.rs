@@ -556,7 +556,6 @@ impl QGoApp {
         self.autocomplete.reset();
         self.refresh_visible();
         self.set_visible(ctx, true);
-        self.activate_window = true;
         self.focus_input = true;
         self.restore_position = true;
     }
@@ -570,13 +569,13 @@ impl QGoApp {
         self.autocomplete.reset();
         self.visible.clear();
         self.search_buffer = SearchBuffer::default();
-        self.activate_window = false;
         self.focus_input = false;
         self.set_visible(ctx, false);
     }
 
     fn set_visible(&mut self, ctx: &egui::Context, visible: bool) {
         self.window_visible = visible;
+        self.activate_window = visible;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
         if visible {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
